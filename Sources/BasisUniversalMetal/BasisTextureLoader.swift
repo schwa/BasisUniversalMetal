@@ -8,200 +8,279 @@ public enum BasisTextureError: Error, Equatable {
     case unsupportedTexture(String)
     case textureCreationFailed
     case transcodeFailed(level: Int, layer: Int, face: Int)
+    case uploadFailed(String)
 }
 
 /// Transcodes KTX2 + Basis Universal data (as used by `KHR_texture_basisu`) into an `MTLTexture`.
-public struct BasisTextureLoader: Sendable {
-    public let device: MTLDevice
-    /// When true, always transcode to uncompressed RGBA8 / RGBA16F (CPU-readable, larger).
-    public var forceUncompressed: Bool
+/// Also loads plain ASTC KTX2 files (`EXT_texture_astc`).
+public struct BasisTextureLoader: @unchecked Sendable {
+    public enum ColorSpace: Sendable {
+        /// Use the KTX2 file's transfer function.
+        case fromFile
+        case sRGB
+        case linear
+    }
 
-    public init(device: MTLDevice, forceUncompressed: Bool = false) {
+    public let device: MTLDevice
+    public let commandQueue: MTLCommandQueue
+    /// When true, always transcode to uncompressed RGBA8 / RGBA16F (larger, but CPU-readable and mipmap-generatable).
+    public var forceUncompressed: Bool
+    var capabilities: GPUCapabilities
+
+    public init(device: MTLDevice, commandQueue: MTLCommandQueue? = nil, forceUncompressed: Bool = false) {
         Self.initializeOnce
         self.device = device
+        self.commandQueue = commandQueue ?? device.makeCommandQueue()!
         self.forceUncompressed = forceUncompressed
+        capabilities = GPUCapabilities(device: device)
     }
 
     private static let initializeOnce: Void = bt_init()
 
-    public func makeTexture(from data: Data, usage: MTLTextureUsage = .shaderRead, label: String? = nil) throws -> MTLTexture {
-        try data.withUnsafeBytes { buffer in
-            guard let base = buffer.baseAddress, buffer.count >= 4, buffer.count <= Int(UInt32.max) else {
+    /// - Parameters:
+    ///   - colorSpace: overrides the file's sRGB/linear flag (glTF decides this by material slot). Ignored for HDR.
+    ///   - generateMipmaps: for single-level files, build a full mip chain on the GPU. This forces an
+    ///     uncompressed format because Metal cannot generate mipmaps for compressed formats.
+    ///     Plain ASTC files can't be decoded on the CPU, so they keep a single level.
+    ///   - storageMode: nil uses Metal's default; `.private` uploads through a staging buffer.
+    public func makeTexture(
+        from data: Data,
+        colorSpace: ColorSpace = .fromFile,
+        generateMipmaps: Bool = false,
+        storageMode: MTLStorageMode? = nil,
+        usage: MTLTextureUsage = .shaderRead,
+        label: String? = nil
+    ) throws -> MTLTexture {
+        try data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress, bytes.count >= 4, bytes.count <= Int(UInt32.max) else {
                 throw BasisTextureError.invalidKTX2
             }
-            let handle = bt_ktx2_open(UInt64(UInt(bitPattern: base)), UInt32(buffer.count))
+            let request = Request(colorSpace: colorSpace, generateMipmaps: generateMipmaps, storageMode: storageMode, usage: usage, label: label)
+            let handle = bt_ktx2_open(UInt64(UInt(bitPattern: base)), UInt32(bytes.count))
             guard handle != 0 else {
-                throw BasisTextureError.invalidKTX2
+                // Not Basis-readable; maybe plain ASTC.
+                let file = try KTX2File(bytes)
+                guard file.astcKind != nil else {
+                    throw BasisTextureError.invalidKTX2
+                }
+                return try makeRawASTCTexture(file: file, bytes: bytes, request: request)
             }
             defer { bt_ktx2_close(handle) }
             guard bt_ktx2_start_transcoding(handle) != 0 else {
                 throw BasisTextureError.startTranscodingFailed
             }
-            return try transcode(handle: handle, usage: usage, label: label)
+            return try makeBasisTexture(handle: handle, request: request)
         }
     }
 
-    private func transcode(handle: UInt64, usage: MTLTextureUsage, label: String?) throws -> MTLTexture {
-        let width = Int(bt_ktx2_get_width(handle))
-        let height = Int(bt_ktx2_get_height(handle))
-        let levels = max(1, Int(bt_ktx2_get_levels(handle)))
-        let faces = max(1, Int(bt_ktx2_get_faces(handle)))
-        let layers = max(1, Int(bt_ktx2_get_layers(handle)))
+    struct Request {
+        var colorSpace: ColorSpace
+        var generateMipmaps: Bool
+        var storageMode: MTLStorageMode?
+        var usage: MTLTextureUsage
+        var label: String?
+
+        func isSRGB(file: Bool) -> Bool {
+            switch colorSpace {
+            case .fromFile: file
+            case .sRGB: true
+            case .linear: false
+            }
+        }
+    }
+
+    struct Shape {
+        var width: Int
+        var height: Int
+        var levels: Int
+        var faces: Int
+        var layers: Int
+    }
+
+    private func makeBasisTexture(handle: UInt64, request: Request) throws -> MTLTexture {
         guard bt_ktx2_is_video(handle) == 0 else {
             throw BasisTextureError.unsupportedTexture("video KTX2 files are not supported")
         }
-        guard faces == 1 || faces == 6 else {
-            throw BasisTextureError.unsupportedTexture("faces = \(faces)")
-        }
-
+        let shape = Shape(
+            width: Int(bt_ktx2_get_width(handle)),
+            height: Int(bt_ktx2_get_height(handle)),
+            levels: max(1, Int(bt_ktx2_get_levels(handle))),
+            faces: max(1, Int(bt_ktx2_get_faces(handle))),
+            layers: max(1, Int(bt_ktx2_get_layers(handle)))
+        )
+        let generating = request.generateMipmaps && shape.levels == 1 && max(shape.width, shape.height) > 1
         let target = try TargetFormat.choose(
             basisFormat: bt_ktx2_get_basis_tex_format(handle),
-            isSRGB: bt_ktx2_is_srgb(handle) != 0,
-            device: device,
-            forceUncompressed: forceUncompressed
+            isSRGB: request.isSRGB(file: bt_ktx2_is_srgb(handle) != 0),
+            capabilities: forceUncompressed || generating ? .uncompressedOnly : capabilities
         )
+        return try makeTexture(shape: shape, target: target, generateMipmaps: generating, request: request) { level, layer, face, destination in
+            // State 0 = the handle's own state. Don't use bt_ktx2_create_transcode_state():
+            // it zero-inits the cached level index, breaking level 0 of Zstd files (issue #7).
+            let ok = bt_ktx2_transcode_image_level(
+                handle, UInt32(level), UInt32(layer), UInt32(face),
+                UInt64(UInt(bitPattern: destination.baseAddress)),
+                UInt32(destination.count / target.bytesPerUnit), target.transcoderFormat, 0,
+                0, 0, -1, -1, 0
+            )
+            guard ok != 0 else {
+                throw BasisTextureError.transcodeFailed(level: level, layer: layer, face: face)
+            }
+        }
+    }
+
+    private func makeRawASTCTexture(file: KTX2File, bytes: UnsafeRawBufferPointer, request: Request) throws -> MTLTexture {
+        guard file.depth == 1, file.faces == 1 || file.faces == 6 else {
+            throw BasisTextureError.unsupportedTexture("3D or unusual-face KTX2 files are not supported")
+        }
+        let target: TargetFormat
+        switch file.astcKind {
+        case let .ldr(size, isSRGB):
+            guard capabilities.astcLDR, !forceUncompressed else {
+                throw BasisTextureError.unsupportedTexture("plain ASTC LDR KTX2 needs a GPU with ASTC support")
+            }
+            target = TargetFormat.astcLDR(size, isSRGB: request.isSRGB(file: isSRGB))!
+        case let .hdr(size):
+            guard capabilities.astcHDR, !forceUncompressed else {
+                throw BasisTextureError.unsupportedTexture("plain ASTC HDR KTX2 needs a GPU with ASTC HDR support")
+            }
+            target = TargetFormat.astcHDR(size)!
+        case nil:
+            throw BasisTextureError.invalidKTX2
+        }
+        let shape = Shape(width: file.width, height: file.height, levels: file.levels.count, faces: file.faces, layers: file.layers)
+        var cachedLevel = -1
+        var levelData = Data()
+        return try makeTexture(shape: shape, target: target, generateMipmaps: false, request: request) { level, layer, face, destination in
+            if level != cachedLevel {
+                levelData = try file.levelData(level, in: bytes)
+                cachedLevel = level
+            }
+            let start = (layer * shape.faces + face) * destination.count
+            guard start + destination.count <= levelData.count else {
+                throw BasisTextureError.invalidKTX2
+            }
+            levelData.copyBytes(to: destination.bindMemory(to: UInt8.self), from: start ..< start + destination.count)
+        }
+    }
+
+    /// Creates the texture, fills each image through `writeImage`, and uploads it.
+    private func makeTexture(
+        shape: Shape,
+        target: TargetFormat,
+        generateMipmaps: Bool,
+        request: Request,
+        writeImage: (_ level: Int, _ layer: Int, _ face: Int, _ destination: UnsafeMutableRawBufferPointer) throws -> Void
+    ) throws -> MTLTexture {
+        guard shape.width > 0, shape.height > 0 else {
+            throw BasisTextureError.invalidKTX2
+        }
+        guard shape.faces == 1 || shape.faces == 6 else {
+            throw BasisTextureError.unsupportedTexture("faces = \(shape.faces)")
+        }
+        if request.storageMode == .memoryless {
+            throw BasisTextureError.unsupportedTexture("memoryless storage")
+        }
 
         let descriptor = MTLTextureDescriptor()
         descriptor.pixelFormat = target.pixelFormat
-        descriptor.width = width
-        descriptor.height = height
-        descriptor.mipmapLevelCount = levels
-        descriptor.usage = usage
-        switch (faces, layers) {
+        descriptor.width = shape.width
+        descriptor.height = shape.height
+        descriptor.mipmapLevelCount = generateMipmaps
+            ? Int(log2(Double(max(shape.width, shape.height)))) + 1
+            : shape.levels
+        descriptor.usage = request.usage
+        if let storageMode = request.storageMode {
+            descriptor.storageMode = storageMode
+        }
+        switch (shape.faces, shape.layers) {
         case (1, 1):
             descriptor.textureType = .type2D
         case (1, _):
             descriptor.textureType = .type2DArray
-            descriptor.arrayLength = layers
+            descriptor.arrayLength = shape.layers
         case (6, 1):
             descriptor.textureType = .typeCube
         default:
             descriptor.textureType = .typeCubeArray
-            descriptor.arrayLength = layers
+            descriptor.arrayLength = shape.layers
         }
         guard let texture = device.makeTexture(descriptor: descriptor) else {
             throw BasisTextureError.textureCreationFailed
         }
-        texture.label = label
+        texture.label = request.label
 
-        let bytesPerUnit = Int(bt_basis_get_bytes_per_block_or_pixel(target.transcoderFormat))
-        var output: [UInt8] = []
-        for level in 0 ..< levels {
-            let levelWidth = max(1, width >> level)
-            let levelHeight = max(1, height >> level)
-            let unitsX: Int
-            let unitsY: Int
-            if let block = target.blockSize {
-                unitsX = (levelWidth + block.width - 1) / block.width
-                unitsY = (levelHeight + block.height - 1) / block.height
-            } else {
-                unitsX = levelWidth
-                unitsY = levelHeight
+        struct Image {
+            var level: Int
+            var slice: Int
+            var width: Int
+            var height: Int
+            var bytesPerRow: Int
+            var offset: Int
+            var length: Int
+        }
+        var images: [Image] = []
+        var totalLength = 0
+        for level in 0 ..< shape.levels {
+            let width = max(1, shape.width >> level)
+            let height = max(1, shape.height >> level)
+            let block = target.blockSize ?? BlockSize(width: 1, height: 1)
+            let unitsX = (width + block.width - 1) / block.width
+            let unitsY = (height + block.height - 1) / block.height
+            let length = unitsX * unitsY * target.bytesPerUnit
+            for slice in 0 ..< shape.layers * shape.faces {
+                images.append(Image(level: level, slice: slice, width: width, height: height, bytesPerRow: unitsX * target.bytesPerUnit, offset: totalLength, length: length))
+                totalLength += length
             }
-            let unitCount = unitsX * unitsY
-            output.removeAll(keepingCapacity: true)
-            output.append(contentsOf: repeatElement(0, count: unitCount * bytesPerUnit))
+        }
 
-            for layer in 0 ..< layers {
-                for face in 0 ..< faces {
-                    try output.withUnsafeMutableBytes { outputBuffer in
-                        let ok = bt_ktx2_transcode_image_level(
-                            handle, UInt32(level), UInt32(layer), UInt32(face),
-                            UInt64(UInt(bitPattern: outputBuffer.baseAddress)),
-                            UInt32(unitCount), target.transcoderFormat, 0,
-                            // State 0 = the handle's own state. Don't use bt_ktx2_create_transcode_state():
-                            // it zero-inits the cached level index, breaking level 0 of Zstd files.
-                            0, 0, -1, -1, 0
-                        )
-                        guard ok != 0 else {
-                            throw BasisTextureError.transcodeFailed(level: level, layer: layer, face: face)
-                        }
-                        texture.replace(
-                            region: MTLRegionMake2D(0, 0, levelWidth, levelHeight),
-                            mipmapLevel: level,
-                            slice: layer * faces + face,
-                            withBytes: outputBuffer.baseAddress!,
-                            bytesPerRow: unitsX * bytesPerUnit,
-                            bytesPerImage: 0
-                        )
-                    }
-                }
+        guard let staging = device.makeBuffer(length: totalLength, options: .storageModeShared) else {
+            throw BasisTextureError.uploadFailed("staging buffer allocation failed")
+        }
+        for image in images {
+            let destination = UnsafeMutableRawBufferPointer(start: staging.contents() + image.offset, count: image.length)
+            try writeImage(image.level, image.slice / shape.faces, image.slice % shape.faces, destination)
+        }
+
+        let usesBlit = texture.storageMode == .private
+        if !usesBlit {
+            for image in images {
+                texture.replace(
+                    region: MTLRegionMake2D(0, 0, image.width, image.height),
+                    mipmapLevel: image.level,
+                    slice: image.slice,
+                    withBytes: staging.contents() + image.offset,
+                    bytesPerRow: image.bytesPerRow,
+                    bytesPerImage: 0
+                )
             }
+        }
+        guard usesBlit || generateMipmaps else {
+            return texture
+        }
+        guard let commandBuffer = commandQueue.makeCommandBuffer(), let blit = commandBuffer.makeBlitCommandEncoder() else {
+            throw BasisTextureError.uploadFailed("could not create blit encoder")
+        }
+        if usesBlit {
+            for image in images {
+                blit.copy(
+                    from: staging, sourceOffset: image.offset,
+                    sourceBytesPerRow: image.bytesPerRow, sourceBytesPerImage: image.length,
+                    sourceSize: MTLSize(width: image.width, height: image.height, depth: 1),
+                    to: texture, destinationSlice: image.slice, destinationLevel: image.level,
+                    destinationOrigin: MTLOrigin()
+                )
+            }
+        }
+        if generateMipmaps {
+            blit.generateMipmaps(for: texture)
+        }
+        blit.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw BasisTextureError.uploadFailed(error.localizedDescription)
         }
         return texture
-    }
-}
-
-struct TargetFormat {
-    var transcoderFormat: UInt32
-    var pixelFormat: MTLPixelFormat
-    var blockSize: (width: Int, height: Int)?
-
-    static func choose(basisFormat: UInt32, isSRGB: Bool, device: MTLDevice, forceUncompressed: Bool) throws -> TargetFormat {
-        let supportsASTC = !forceUncompressed && device.supportsFamily(.apple2)
-        let supportsASTCHDR = !forceUncompressed && device.supportsFamily(.apple6)
-        let supportsBC = !forceUncompressed && device.supportsBCTextureCompression
-
-        func rgba32() -> TargetFormat {
-            TargetFormat(transcoderFormat: UInt32(TF_RGBA32), pixelFormat: isSRGB ? .rgba8Unorm_srgb : .rgba8Unorm, blockSize: nil)
-        }
-        func bc7() -> TargetFormat {
-            TargetFormat(transcoderFormat: UInt32(TF_BC7_RGBA), pixelFormat: isSRGB ? .bc7_rgbaUnorm_srgb : .bc7_rgbaUnorm, blockSize: (4, 4))
-        }
-        func ldr(_ preferredASTC: TargetFormat) -> TargetFormat {
-            if supportsASTC { return preferredASTC }
-            if supportsBC { return bc7() }
-            return rgba32()
-        }
-        func hdr(_ preferredASTC: TargetFormat) -> TargetFormat {
-            if supportsASTCHDR { return preferredASTC }
-            if supportsBC { return TargetFormat(transcoderFormat: UInt32(TF_BC6H), pixelFormat: .bc6H_rgbuFloat, blockSize: (4, 4)) }
-            return TargetFormat(transcoderFormat: UInt32(TF_RGBA_HALF), pixelFormat: .rgba16Float, blockSize: nil)
-        }
-
-        switch Int32(basisFormat) {
-        case BTF_ETC1S, BTF_UASTC_LDR_4X4:
-            return ldr(astcLDR(4, 4, isSRGB: isSRGB)!)
-        case BTF_XUBC7:
-            if supportsBC { return bc7() }
-            return ldr(astcLDR(4, 4, isSRGB: isSRGB)!)
-        case BTF_UASTC_HDR_4X4:
-            return hdr(TargetFormat(transcoderFormat: UInt32(TF_ASTC_HDR_4X4_RGBA), pixelFormat: .astc_4x4_hdr, blockSize: (4, 4)))
-        case BTF_ASTC_HDR_6X6, BTF_UASTC_HDR_6X6:
-            return hdr(TargetFormat(transcoderFormat: UInt32(TF_ASTC_HDR_6X6_RGBA), pixelFormat: .astc_6x6_hdr, blockSize: (6, 6)))
-        default:
-            // XUASTC / ASTC LDR at various block sizes: transcode to the matching ASTC format.
-            guard bt_basis_tex_format_is_ldr(basisFormat) != 0 else {
-                throw BasisTextureError.unsupportedTexture("basis format \(basisFormat)")
-            }
-            let width = Int(bt_basis_tex_format_get_block_width(basisFormat))
-            let height = Int(bt_basis_tex_format_get_block_height(basisFormat))
-            guard let astc = astcLDR(width, height, isSRGB: isSRGB) else {
-                throw BasisTextureError.unsupportedTexture("ASTC block size \(width)x\(height)")
-            }
-            return ldr(astc)
-        }
-    }
-
-    static func astcLDR(_ width: Int, _ height: Int, isSRGB: Bool) -> TargetFormat? {
-        let entry: (Int32, MTLPixelFormat, MTLPixelFormat)
-        switch (width, height) {
-        case (4, 4): entry = (TF_ASTC_LDR_4X4_RGBA, .astc_4x4_ldr, .astc_4x4_srgb)
-        case (5, 4): entry = (TF_ASTC_LDR_5X4_RGBA, .astc_5x4_ldr, .astc_5x4_srgb)
-        case (5, 5): entry = (TF_ASTC_LDR_5X5_RGBA, .astc_5x5_ldr, .astc_5x5_srgb)
-        case (6, 5): entry = (TF_ASTC_LDR_6X5_RGBA, .astc_6x5_ldr, .astc_6x5_srgb)
-        case (6, 6): entry = (TF_ASTC_LDR_6X6_RGBA, .astc_6x6_ldr, .astc_6x6_srgb)
-        case (8, 5): entry = (TF_ASTC_LDR_8X5_RGBA, .astc_8x5_ldr, .astc_8x5_srgb)
-        case (8, 6): entry = (TF_ASTC_LDR_8X6_RGBA, .astc_8x6_ldr, .astc_8x6_srgb)
-        case (8, 8): entry = (TF_ASTC_LDR_8X8_RGBA, .astc_8x8_ldr, .astc_8x8_srgb)
-        case (10, 5): entry = (TF_ASTC_LDR_10X5_RGBA, .astc_10x5_ldr, .astc_10x5_srgb)
-        case (10, 6): entry = (TF_ASTC_LDR_10X6_RGBA, .astc_10x6_ldr, .astc_10x6_srgb)
-        case (10, 8): entry = (TF_ASTC_LDR_10X8_RGBA, .astc_10x8_ldr, .astc_10x8_srgb)
-        case (10, 10): entry = (TF_ASTC_LDR_10X10_RGBA, .astc_10x10_ldr, .astc_10x10_srgb)
-        case (12, 10): entry = (TF_ASTC_LDR_12X10_RGBA, .astc_12x10_ldr, .astc_12x10_srgb)
-        case (12, 12): entry = (TF_ASTC_LDR_12X12_RGBA, .astc_12x12_ldr, .astc_12x12_srgb)
-        default: return nil
-        }
-        return TargetFormat(transcoderFormat: UInt32(entry.0), pixelFormat: isSRGB ? entry.2 : entry.1, blockSize: (width, height))
     }
 }
