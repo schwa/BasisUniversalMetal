@@ -115,3 +115,17 @@ created: 2026-10-06T18:57:20Z
 basis_universal @ 99f52d63: new ktx2_transcode_state_t() value-initializes ktx2_transcoder_state, so m_uncomp_data_level_index is 0, not -1. Repro: open a UASTC+Zstd KTX2, create a state with bt_ktx2_create_transcode_state(), transcode level 0. Expected: success. Actual: assert at basisu_transcoder.cpp:20807 (debug), returns false (release). Not yet reported to BinomialLLC.
 
 ---
+
+## 9: Plain ASTC KTX2 files cannot be loaded
+
++++
+status: new
+priority: low
+kind: feature
+labels: effort:s
+created: 2026-10-06T18:59:24Z
++++
+
+makeTexture(from:) only handles KTX2 files holding Basis Universal data. glTF's EXT_texture_astc stores ASTC blocks directly in KTX2 (vkFormat = a VK_FORMAT_ASTC_* value, no Basis payload), which Apple GPUs can sample as-is with no transcoding. Wanted: detect such files, map the vkFormat to the matching MTLPixelFormat (block size, sRGB vs UNORM, HDR), and upload each level's bytes directly; handle zstd supercompression if present (the zstd decoder is already vendored). On GPUs without ASTC (Intel Macs) either decode on the CPU or fail with a clear error. Unknown: whether upstream's C API exposes enough to read non-Basis KTX2 levels, or whether this needs a small KTX2 reader of our own. Needed by MetalSprocketsGLTF #88 (EXT_texture_astc); no glTF-Sample-Assets model uses it, so tests need generated files (astcenc + ktx create).
+
+---
