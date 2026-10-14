@@ -230,8 +230,10 @@ struct LoadingOptionsTests {
         let original = try resourceData(name)
         var plain = original
         let dfdOffset = Int(original.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 48, as: UInt32.self) })
-        #expect(plain[dfdOffset + 12] == 167) // KHR_DF_MODEL_UASTC_HDR_4X4
-        plain[dfdOffset + 12] = 162 // KHR_DF_MODEL_ASTC
+        let dfModelUASTCHDR4x4: UInt8 = 167
+        let dfModelASTC: UInt8 = 162
+        #expect(plain[dfdOffset + 12] == dfModelUASTCHDR4x4)
+        plain[dfdOffset + 12] = dfModelASTC
         let loader = BasisTextureLoader(device: device)
         let basis = try loader.makeTexture(from: original)
         let raw = try loader.makeTexture(from: plain)

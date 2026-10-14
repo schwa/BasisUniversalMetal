@@ -164,7 +164,6 @@ public struct BasisTextureLoader: @unchecked Sendable {
         }
     }
 
-    /// Creates the texture, fills each image through `writeImage`, and uploads it.
     private func makeTexture(
         shape: Shape,
         target: TargetFormat,

@@ -1,7 +1,7 @@
 import CBasisUniversal
 import Foundation
 
-/// Minimal KTX2 reader for files the Basis transcoder rejects but Metal can sample directly (plain ASTC).
+/// Minimal KTX2 reader for plain ASTC files the Basis transcoder rejects (such as ASTC HDR) but Metal can sample directly.
 struct KTX2File {
     struct Level {
         var byteOffset: Int
