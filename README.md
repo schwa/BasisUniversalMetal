@@ -1,6 +1,6 @@
 # BasisUniversalMetal
 
-KTX2 / Basis Universal (`KHR_texture_basisu`) and plain ASTC KTX2 (`EXT_texture_astc`) → `MTLTexture`, via upstream's plain C transcoder API. No C++ interop.
+Loads KTX2 / Basis Universal (`KHR_texture_basisu`) and plain ASTC KTX2 (`EXT_texture_astc`) files into `MTLTexture`s. Uses upstream's plain C transcoder API, so no C++ interop is needed.
 
 ```swift
 let loader = BasisTextureLoader(device: device)
