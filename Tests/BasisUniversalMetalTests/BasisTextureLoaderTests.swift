@@ -223,10 +223,12 @@ struct LoadingOptionsTests {
     }
 
     /// Issue #9: standard ASTC HDR 4x4 KTX2 (DFD color model ASTC) is rejected by the Basis transcoder.
-    @Test(arguments: ["uastc_hdr", "uastc_hdr_nozstd"])
+    @Test(
+        .enabled(if: MTLCreateSystemDefaultDevice()?.supportsFamily(.apple6) == true, "Needs ASTC HDR (apple6)"),
+        arguments: ["uastc_hdr", "uastc_hdr_nozstd"]
+    )
     func plainASTCHDRFile(name: String) throws {
         let device = try makeDevice()
-        try #require(device.supportsFamily(.apple6))
         let original = try resourceData(name)
         var plain = original
         let dfdOffset = Int(original.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 48, as: UInt32.self) })
